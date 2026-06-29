@@ -16,7 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
 
-from fla.ops.triton.triton_core.causal_conv1d import causal_conv1d_triton
 from fla.ops.triton.triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from fla.ops.triton.triton_core.cumsum import chunk_local_cumsum
 from fla.ops.triton.triton_core.l2norm import l2norm_bwd, l2norm_fwd
@@ -631,6 +630,60 @@ class QwenStyleRMSNormGated(nn.Module):
         hidden_states = hidden_states * torch.nn.functional.silu(gate.to(hidden_states.dtype))
         return hidden_states.to(inp_dtype)
 
+class CausalConv1dFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        conv_states: torch.Tensor,
+        query_start_loc: Optional[list[int]],
+        cache_indices: Optional[list[int]],
+        initial_state_mode: Optional[list[int]],
+        num_accepted_tokens: Optional[list[int]],
+        activation_mode: int,
+        pad_slot_id: int,
+        run_mode: int,
+        head_num: int,
+    ):
+        y = torch.ops.npu.npu_causal_conv1d(
+            x,
+            weight=weight,
+            bias=bias,
+            conv_states=conv_states,
+            query_start_loc=query_start_loc,
+            cache_indices=cache_indices,
+            initial_state_mode=initial_state_mode,
+            num_accepted_tokens=num_accepted_tokens,
+            activation_mode=activation_mode,
+            pad_slot_id=pad_slot_id,
+            run_mode=run_mode,
+            head_num=head_num,
+        )
+        ctx.save_for_backward(x, y, weight)
+        ctx.query_start_loc = query_start_loc
+        ctx.activation_mode = activation_mode
+        ctx.head_num = head_num
+        return y
+
+    @staticmethod
+    def backward(ctx, dy: torch.Tensor):
+        x, y, weight = ctx.saved_tensors
+        input_layout = "BNSD" if ctx.head_num > 0 else "BSND"
+
+        dx, dw, _db, _dh0 = torch.ops.npu.npu_causal_conv1d_bwd(
+            x,
+            y,
+            weight,
+            dy,
+            initial_state=None,
+            dht=None,
+            query_start_loc=ctx.query_start_loc,
+            activation=ctx.activation_mode,
+            input_layout=input_layout,
+        )
+        return dx, dw, None, None, None, None, None, None, None, None, None, None
 
 class DemoGatedDeltaNet(nn.Module):
 
@@ -699,22 +752,37 @@ class DemoGatedDeltaNet(nn.Module):
         if cu_seqlens is not None and cu_seqlens.device != mixed_qkv.device:
             cu_seqlens = cu_seqlens.to(mixed_qkv.device)
 
-        mixed_qkv, _ = causal_conv1d_triton(
-            mixed_qkv,
-            weight=weight,
-            H=2 * self.num_k_heads + self.num_v_heads,
-            bias=bias,
-            residual=None,
-            initial_state=None,
-            activation=self.activation,
-            cu_seqlens=cu_seqlens,
-            output_final_state=False,
-        )
+        cu_list = cu_seqlens.detach().tolist() if cu_seqlens is not None else None
+        cu_seqlens_list: Optional[list[int]] = cu_list if cu_list is not None else None
 
-        query, key, value = mixed_qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim).transpose(1, 2).contiguous()
-        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim).transpose(1, 2).contiguous()
-        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim).transpose(1, 2).contiguous()
+        if weight.shape[0] >= 16 and weight.shape[1] <= 4 and weight.is_contiguous():
+            warnings.warn(
+                f"npu_causal_conv1d does not support transposed weight shape={tuple(weight.shape)}，"
+                "op need to transpose weight inner, which may cause performance loss",
+                stacklevel=1,
+            )
+            weight = weight.transpose(0, 1)
+
+        num_seqs = len(cu_list) - 1 if cu_list is not None else 1
+        conv_states = torch.zeros(
+            num_seqs, weight.shape[0] - 1, mixed_qkv.shape[-1],
+            dtype=mixed_qkv.dtype, device=mixed_qkv.device
+        )
+        mixed_qkv = CausalConv1dFunction.apply(
+            mixed_qkv,
+            weight,
+            None,                # bias
+            conv_states,
+            cu_list,
+            None,                # cache_indices
+            None,                # initial_state_mode
+            None,                # num_accepted_tokens
+            1,                   # activation_mode = silu
+            -1,                  # pad_slot_id
+            0,                   # run_mode = prefill
+            2 * self.num_k_heads + self.num_v_heads,            # >0:head-first 输出,省去 Q/K/V 的后续 transpose
+        )
+        query, key, value = mixed_qkv.split([self.num_k_heads, self.num_k_heads, self.num_v_heads], dim=1)
 
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
@@ -723,9 +791,6 @@ class DemoGatedDeltaNet(nn.Module):
         if repeat > 1:
             query = query.repeat_interleave(repeat, dim=1)
             key = key.repeat_interleave(repeat, dim=1)
-
-        cu_list = cu_seqlens.detach().tolist() if cu_seqlens is not None else None
-        cu_seqlens_list: Optional[list[int]] = cu_list if cu_list is not None else None
 
         core_attn_out, _ = flash_gated_delta_rule(
             query,
